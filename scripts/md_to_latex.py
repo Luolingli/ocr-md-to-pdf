@@ -383,6 +383,35 @@ def detect_title(md, J):
     return m.group(1).strip() if m else "Document"
 
 
+# ------------------------------------------------------------ heading repair
+# OCR mislabels structure around section headings in two recurring ways:
+#  * a theorem / definition / example paragraph gets a spurious "### N.M …" prefix
+#    (its theorem number looks like a section number) — demote it back to body so
+#    it stops polluting the TOC (e.g. "### 10.21 定义 考虑检验", "### 21.4 定理 …").
+#  * a real section title is left un-marked — either as a plain "N.1 引言" line, or
+#    rendered as a spaced-out display formula — so it never reaches the TOC; promote it.
+THM_KW = r'(?:定理|定义|引理|推论|命题|性质|例|证明|假设|算法|公理|结论|定律|注记|注解)'
+SECTION_THM_RE = re.compile(r'^\d+\.\d+\s*' + THM_KW)
+INTRO_SEC_RE = re.compile(r'^\d+(?:\.\d+)?\s*引\s*言\s*$')
+HEADING_FORMULA_BAN = re.compile(
+    r'[=<>+]|\\frac|\\sum|\\int|\\prod|\\lim|\\sqrt|\\le|\\ge|\\neq|\\pm|\\cdot|\\times|\\sim')
+
+
+def formula_is_heading(content):
+    """True if a display formula is really a spaced-out section title, e.g.
+    '10.3\\quad\\chi^{2}\\quad 分 \\quad 布' (a section, not an equation)."""
+    if not re.match(r'^\s*\d+\.\d+\s*\\quad', content):
+        return False
+    if HEADING_FORMULA_BAN.search(content):
+        return False
+    return bool(re.search(r'[一-鿿]', content)) and len(content) < 60
+
+
+def formula_heading_text(content):
+    parts = re.split(r'\\quad', content)
+    return (parts[0].strip() + ' ' + ''.join(p.strip() for p in parts[1:])).strip()
+
+
 # ---------------------------------------------------------------- main pipeline
 def convert(md, imgdir, fontset, title, author, drop_toc):
     md = re.sub(r'\\n(?![A-Za-z])', ' ', md)
@@ -390,6 +419,11 @@ def convert(md, imgdir, fontset, title, author, drop_toc):
                 lambda m: CIRCLED[int(m.group(1)) - 1] if 1 <= int(m.group(1)) <= 10 else m.group(0), md)
     if drop_toc:
         md = re.sub(r'\n##\s*目录\s*\n.*?(?=\n##\s)', '\n', md, flags=re.S)
+    # a section title OCR'd as a spaced-out display formula -> a real ### heading
+    md = re.sub(r'\$\$(.+?)\$\$',
+                lambda m: ('\n### ' + formula_heading_text(m.group(1)) + '\n')
+                          if formula_is_heading(m.group(1)) else m.group(0),
+                md, flags=re.S)
     md = re.sub(r'\$\$(.+?)\$\$',
                 lambda m: '\n\x00D%d\x00\n' % (DISPLAY.append(m.group(1)) or len(DISPLAY) - 1),
                 md, flags=re.S)
@@ -421,6 +455,12 @@ def convert(md, imgdir, fontset, title, author, drop_toc):
 
     def heading(level, t):
         flush()
+        if level == 3 and SECTION_THM_RE.match(t.strip()):
+            # a theorem/example paragraph mis-prefixed with ### — render as body text
+            # (footnote markers kept inline), never as a TOC section.
+            REPORT["demoted_headings"].append(t.strip())
+            out.append(render_inline(t)); out.append('')
+            return
         t = re.sub('\x00F(\\d+)\x00',
                    lambda m: FOOTNOTE_LEFTOVERS.append(FOOTNOTES[int(m.group(1))]) or '', t)
         printed = render_inline(t)
@@ -476,6 +516,8 @@ def convert(md, imgdir, fontset, title, author, drop_toc):
         mh = HEAD.match(line)
         if mh:
             heading(len(mh.group(1)), mh.group(2)); continue
+        if INTRO_SEC_RE.match(st):       # "N.1 引言" left un-marked by OCR -> section
+            heading(3, st); continue
         buf.append(st)
     flush()
 
@@ -516,9 +558,15 @@ def main():
     ap.add_argument("--report", help="write a review.json of high-risk spots for AI/human review")
     ap.add_argument("--overrides", help="{math_id: corrected_latex_body} json applied to math")
     ap.add_argument("--symbols", help="{char: latex} json merged into the symbol map")
+    ap.add_argument("--corrections", help="{wrong_text: right_text} literal fixes applied to "
+                    "the raw md (for semantic OCR errors the core can't detect, e.g. a "
+                    "misread character in a heading)")
     a = ap.parse_args()
 
     md_text = open(a.input, encoding="utf-8").read()
+    if a.corrections and os.path.exists(a.corrections):
+        for wrong, right in json.load(open(a.corrections, encoding="utf-8")).items():
+            md_text = md_text.replace(wrong, right)
     json_path = a.json or (os.path.splitext(a.input)[0] + ".json")
     out_path = a.out or os.path.join(os.path.dirname(os.path.abspath(a.input)), "book.tex")
     try:

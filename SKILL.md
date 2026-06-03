@@ -115,6 +115,12 @@ effort only on the handful of flagged spots:
    { "7ef8563c": "s = \\sqrt{\\mathbb{V}(\\widehat{Y}_*)}" }
    ```
    For unmapped glyphs, write `symbols.json`, e.g. `{ "≜": "$\\triangleq$" }`.
+   For a *semantic* OCR error in plain text the core can't flag — a misread character in
+   a heading or sentence (e.g. a section titled "第三部分" that the book's own TOC and
+   context show must be "第二部分") — use `--corrections corrections.json`, a `{wrong:
+   right}` map of literal replacements applied to the raw md. Make each key long enough to
+   be unique (`"MCMC 第三部分": "MCMC 第二部分"`), and only correct what the evidence
+   (the book's printed TOC, surrounding text, the source image) clearly supports.
 4. Re-run with the overrides and recompile — fixes are applied reproducibly, no hand-editing:
    ```bash
    python3 scripts/md_to_latex.py "INPUT.md" --imgmap imgmap.json --imgdir imgs \

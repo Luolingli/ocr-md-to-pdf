@@ -69,6 +69,7 @@ xelatex -interaction=nonstopmode book.tex
 | `--report FILE` | 输出 `review.json`，只列高风险点（被修复过的公式，带 `{page,bbox}`、缺字、被降级的标题、未定位脚注、缺图） |
 | `--overrides FILE` | 应用 `{公式id: 修正后的latex}`（AI 基于证据的修正），可复现 |
 | `--symbols FILE` | 把 `{字符: latex}` 合并进符号表（处理缺字） |
+| `--corrections FILE` | `{错误文本: 正确文本}` 字面替换，修正核心查不出的语义级 OCR 错字（如标题里把"第二部分"误认成"第三部分"）；键取长一点以保证唯一 |
 
 ### 提高准确度：AI 复核回路
 

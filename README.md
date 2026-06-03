@@ -72,6 +72,7 @@ xelatex -interaction=nonstopmode book.tex
 | `--report FILE` | write a `review.json` of only the high-risk spots (repaired formulas with `{page,bbox}`, unmapped glyphs, demoted headings, unplaced footnotes, missing images) |
 | `--overrides FILE` | apply `{math_id: corrected_latex}` (an AI's evidence-based fixes) reproducibly |
 | `--symbols FILE` | merge `{char: latex}` into the symbol map (for unmapped glyphs) |
+| `--corrections FILE` | `{wrong: right}` literal text fixes for semantic OCR errors the core can't flag (e.g. a misread character in a heading); make each key unique |
 
 ### Accuracy: the AI review loop
 
