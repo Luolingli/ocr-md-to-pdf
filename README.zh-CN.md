@@ -2,7 +2,7 @@
 
 # ocr-md-to-pdf
 
-把 **PaddleOCR-VL** 导出的 markdown 编译成一本**全矢量、文字可选中**的 PDF 书（用 XeLaTeX）。
+把 [**PaddleOCR-VL**](https://github.com/PaddlePaddle/PaddleOCR) 导出的 markdown 编译成一本**全矢量、文字可选中**的 PDF 书（用 XeLaTeX）。
 
 对扫描版中文 / 数学教材做 OCR 后，会得到一个 `*.pdf_by_PaddleOCR-VL-*.md`（公式是
 `$ ... $` / `$$ ... $$`，表格是裸 `<table>`，插图是远程 `<img>`），外加一个同名 `*.json`。
@@ -113,6 +113,10 @@ git clone https://github.com/Luolingli/ocr-md-to-pdf ~/.claude/skills/ocr-md-to-
 - PDF 只反映 **OCR 实际识别到的内容**——真正没被识别出来的页面或字符无法凭空补出。
 - 针对 PaddleOCR-VL 的输出（HTML 表格/图片、`$...$` 公式）调校；别的 OCR markdown
   风格可能需要小改 `scripts/md_to_latex.py` 里的正则。
+
+## 致谢
+
+本工具围绕 [PaddleOCR / PaddleOCR-VL](https://github.com/PaddlePaddle/PaddleOCR)（[@PaddlePaddle](https://github.com/PaddlePaddle)）的输出构建，只负责把它转成 PDF，OCR 部分的功劳全归原项目。
 
 ## 许可证
 

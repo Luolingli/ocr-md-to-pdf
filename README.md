@@ -2,7 +2,7 @@
 
 # ocr-md-to-pdf
 
-Compile a **PaddleOCR-VL** markdown export into a fully **vector, selectable-text PDF book** with XeLaTeX.
+Compile a [**PaddleOCR-VL**](https://github.com/PaddlePaddle/PaddleOCR) markdown export into a fully **vector, selectable-text PDF book** with XeLaTeX.
 
 The OCR of a scanned Chinese / math textbook gives you a `*.pdf_by_PaddleOCR-VL-*.md`
 (math in `$ ... $` / `$$ ... $$`, tables as raw `<table>`, figures as remote `<img>`),
@@ -124,6 +124,12 @@ PDF book". See [`SKILL.md`](SKILL.md) for the full workflow and debugging notes.
   can't be invented.
 - Tuned for PaddleOCR-VL output (HTML tables/images, `$...$` math). Other OCR markdown
   flavors may need small tweaks to the regexes in `scripts/md_to_latex.py`.
+
+## Acknowledgements
+
+Built around the output of [PaddleOCR / PaddleOCR-VL](https://github.com/PaddlePaddle/PaddleOCR)
+by [@PaddlePaddle](https://github.com/PaddlePaddle). This tool only converts that output into a
+PDF — all OCR credit goes to them.
 
 ## License
 
