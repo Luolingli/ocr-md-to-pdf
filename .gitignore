@@ -1,0 +1,14 @@
+# build artifacts (in case you build inside the repo)
+imgs/
+imgmap.json
+book.tex
+book.pdf
+*.aux
+*.log
+*.out
+*.toc
+*.synctex.gz
+xelatex*.log
+__pycache__/
+*.pyc
+.DS_Store
