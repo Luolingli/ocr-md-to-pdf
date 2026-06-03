@@ -4,28 +4,50 @@
 Convert a PaddleOCR-VL markdown export (Chinese / math textbook) into a single
 self-contained LaTeX file that XeLaTeX compiles into a fully vector PDF book.
 
-Handles the quirks of PaddleOCR markdown:
+Deterministic core (handles the PaddleOCR quirks automatically):
   * inline `$ ... $` / display `$$ ... $$` math with spaces and embedded CJK
     (CJK runs inside math are wrapped in \\text{} so the math font never misses glyphs)
   * HTML <table> -> bordered longtable (colspan aware)
   * <img ...> -> \\includegraphics from a locally downloaded image map
   * <div style="text-align:center"> -> center environment
-  * circled footnote markers ①..⑩, raw \\textcircled{n}, HTML entities, stray
-    math `<`/`>` written in plain text, malformed arrays / \\left..\\right, etc.
+  * circled footnote markers ①..⑩, raw \\textcircled{n}, HTML entities, stray text
+    `<`/`>`, double sub/superscripts, malformed arrays / \\left..\\right, unbalanced braces
   * recovers footnotes from the sibling *.json (the .md export silently drops them)
   * drops the OCR's own messy table of contents (a clean navigable TOC is generated)
 
+v2 — AI-in-the-loop hybrid (so the *skill* beats a bare script on accuracy):
+  * --report review.json   : emit ONLY the high-risk spots (repaired formulas, unmapped
+                             glyphs, demoted headings, unplaced footnotes, missing images),
+                             each with a stable id and, where matchable, the original-page
+                             {page,bbox} so an AI can inspect the source image and repair.
+  * --overrides FILE       : {math_id: corrected_latex_body} — apply the AI's evidence-based
+                             fixes reproducibly, no hand-editing of generated output.
+  * --symbols FILE         : {char: latex} merged into the symbol map (for unmapped glyphs).
+
 Pure standard library. Usage:  python3 md_to_latex.py INPUT.md [options]
 """
-import re, json, os, argparse
+import re, json, os, argparse, hashlib
 
 CIRCLED = '①②③④⑤⑥⑦⑧⑨⑩'
 GL = CIRCLED
 
-# module-level stores populated during conversion
+# stores populated during conversion
 DISPLAY, INLINE, TABLE, IMG = [], [], [], []
 FOOTNOTES, FOOTNOTE_LEFTOVERS = [], []
-IMGMAP = {}
+IMGMAP, OVERRIDES = {}, {}
+FORMULA_INDEX = {}                       # normalized formula -> {page, bbox}
+REPORT = {"math": [], "unmapped_chars": {}, "demoted_headings": [],
+          "footnotes_unplaced": [], "missing_images": []}
+_seen_math = set()
+
+
+def hid(raw):
+    return hashlib.sha1(raw.strip().encode('utf-8')).hexdigest()[:8]
+
+
+def locate(raw):
+    return FORMULA_INDEX.get(re.sub(r'\s+', '', raw.strip().strip('$')))
+
 
 # ---------------------------------------------------------------- math helpers
 WRAP_RE = re.compile(r'[　-〿一-鿿＀-￯‘’“”…·—–]+')
@@ -33,7 +55,6 @@ ARR_RE = re.compile(r'(\\begin\{array\}\{)([^{}]*)(\})(.*?)(\\end\{array\})', re
 
 
 def fix_arrays(c):
-    """make the array column spec at least as wide as the widest row (OCR under-counts)"""
     def rep(m):
         body = m.group(4)
         maxc = 1
@@ -47,7 +68,6 @@ def fix_arrays(c):
 
 
 def balance_braces(c):
-    """drop unmatched } and close unmatched { so a garbled OCR formula still compiles"""
     out, depth, i, n = [], 0, 0, len(c)
     while i < n:
         ch = c[i]
@@ -71,23 +91,58 @@ def decode_entities(c):
              .replace('&quot;', '"').replace('&#39;', "'").replace('&amp;', r'\&'))
 
 
-def normalize_math(c):
+def normalize_math(c, reasons=None):
+    """normalize OCR math to compilable LaTeX; if `reasons` is a list, record which
+    repairs fired (a non-empty list => the formula is a candidate for AI review)."""
     c = decode_entities(c).strip()
     if not c:
         return ""
-    c = re.sub(r'(?<!\\)%', r'\\%', c)                # escape only bare percent
+    c = re.sub(r'(?<!\\)%', r'\\%', c)
     for k, ch in enumerate(CIRCLED, 1):
         if ch in c:
             c = c.replace(ch, r'{\text{\cnum{%d}}}' % k)
-    c = re.sub(r'_([A-Za-z0-9])_([A-Za-z0-9])', r'_{\1\2}', c)   # a_b_c -> a_{bc}
-    c = re.sub(r'\^([A-Za-z0-9])\^([A-Za-z0-9])', r'^{\1\2}', c)
-    c = WRAP_RE.sub(lambda m: r'\text{' + m.group(0) + '}', c)   # CJK runs -> \text{}
-    c = fix_arrays(c)
-    # insert a "." after a bare \left / \right whose delimiter the OCR dropped
-    # (but never touch \leftarrow, \rightarrow, \rightsquigarrow, ...)
-    c = re.sub(r'\\left(?![A-Za-z\s(\[\]{}|./<>)\\])', r'\\left.', c)
-    c = re.sub(r'\\right(?![A-Za-z\s(\[\]{}|./<>)\\])', r'\\right.', c)
-    return balance_braces(c)
+
+    def step(pattern, repl, tag, s):
+        ns = re.sub(pattern, repl, s)
+        if reasons is not None and ns != s:
+            reasons.append(tag)
+        return ns
+
+    c = step(r'_([A-Za-z0-9])_([A-Za-z0-9])', r'_{\1\2}', 'double_subscript', c)
+    c = step(r'\^([A-Za-z0-9])\^([A-Za-z0-9])', r'^{\1\2}', 'double_superscript', c)
+    c = WRAP_RE.sub(lambda m: r'\text{' + m.group(0) + '}', c)
+    nc = fix_arrays(c)
+    if reasons is not None and nc != c:
+        reasons.append('array_columns')
+    c = nc
+    nc = re.sub(r'\\left(?![A-Za-z\s(\[\]{}|./<>)\\])', r'\\left.', c)
+    nc = re.sub(r'\\right(?![A-Za-z\s(\[\]{}|./<>)\\])', r'\\right.', nc)
+    if reasons is not None and nc != c:
+        reasons.append('left_right_delim')
+    c = nc
+    nc = balance_braces(c)
+    if reasons is not None and nc != c:
+        reasons.append('brace_imbalance')
+    return nc
+
+
+def render_math(raw, kind):
+    """resolve a math block: apply an AI override if present, else normalize and (if it
+    needed repair) record it in the review report. Returns the LaTeX body."""
+    mid = hid(raw)
+    if mid in OVERRIDES:
+        return OVERRIDES[mid]
+    reasons = []
+    body = normalize_math(raw, reasons)
+    if reasons and mid not in _seen_math:
+        _seen_math.add(mid)
+        item = {"id": mid, "kind": kind, "reasons": sorted(set(reasons)),
+                "raw": raw.strip(), "rendered": body}
+        loc = locate(raw)
+        if loc:
+            item.update(loc)
+        REPORT["math"].append(item)
+    return body
 
 
 # ---------------------------------------------------------------- inline text
@@ -121,6 +176,11 @@ ESC = {'&': r'\&', '%': r'\%', '#': r'\#', '_': r'\_', '{': r'\{', '}': r'\}',
 ESC_RE = re.compile(r'[&%#_{}~^\\]')
 
 
+def rebuild_sym_re():
+    global SYM_RE
+    SYM_RE = re.compile('|'.join(re.escape(k) for k in sorted(SYM, key=len, reverse=True)))
+
+
 def render_inline(s):
     if s is None:
         return ""
@@ -132,14 +192,16 @@ def render_inline(s):
         local.append(latex)
         return '\x01%d\x01' % (len(local) - 1)
 
-    s = BARE_CMD.sub(lambda m: stash('$' + m.group(0) + '$'), s)   # bare \Omega, \cup ...
+    s = BARE_CMD.sub(lambda m: stash('$' + m.group(0) + '$'), s)
     s = SYM_RE.sub(lambda m: stash(SYM[m.group(0)]), s)
     s = ESC_RE.sub(lambda m: ESC[m.group(0)], s)
-    s = re.sub(r'\*\*([^*\n]+?)\*\*', r'\\textbf{\1}', s)          # **bold**
+    s = re.sub(r'\*\*([^*\n]+?)\*\*', r'\\textbf{\1}', s)
     s = re.sub('\x01(\\d+)\x01', lambda m: local[int(m.group(1))], s)
-    s = re.sub('\x00I(\\d+)\x00',
-               lambda m: ('$' + normalize_math(INLINE[int(m.group(1))]) + '$')
-               if normalize_math(INLINE[int(m.group(1))]) else '', s)
+
+    def inl(m):
+        body = render_math(INLINE[int(m.group(1))], 'inline')
+        return ('$' + body + '$') if body else ''
+    s = re.sub('\x00I(\\d+)\x00', inl, s)
     s = re.sub('\x00F(\\d+)\x00',
                lambda m: r'\footnote{' + render_footnote(FOOTNOTES[int(m.group(1))]) + '}', s)
     return s
@@ -150,15 +212,14 @@ def render_footnote(raw):
     out, last = [], 0
     for m in re.finditer(r'\$([^$]+?)\$', raw):
         out.append(render_inline(raw[last:m.start()]))
-        n = normalize_math(m.group(1))
-        out.append(('$' + n + '$') if n else '')
+        body = render_math(m.group(1), 'inline')
+        out.append(('$' + body + '$') if body else '')
         last = m.end()
     out.append(render_inline(raw[last:]))
     return ''.join(out).strip()
 
 
 def plain_text(s):
-    """plain text for PDF bookmarks (no math, no commands)"""
     s = re.sub('\x00I(\\d+)\x00', '', s)
     s = re.sub('\x00[DTGF](\\d+)\x00', '', s)
     s = BARE_CMD.sub('', s)
@@ -206,6 +267,7 @@ def convert_img(tag):
         return ''
     fn = IMGMAP.get(msrc.group(1))
     if not fn:
+        REPORT["missing_images"].append(msrc.group(1))
         return r'\par{\centering[\,\textit{图}\,]\par}'
     mw = re.search(r'width="?(\d+)%', tag)
     if mw:
@@ -216,17 +278,19 @@ def convert_img(tag):
     return r'\par\medskip{\centering\includegraphics[%s]{%s}\par}\medskip' % (opt, fn)
 
 
-# ---------------------------------------------------------------- footnote recovery
-def recover_footnotes(md, json_path):
-    """turn ①..⑩ markers into real \\footnote{} using the sibling JSON; returns new md"""
-    try:
-        J = json.load(open(json_path, encoding='utf-8'))
-    except Exception:
-        return md
+# ---------------------------------------------------------------- JSON helpers
+def build_formula_index(J):
+    for pi, page in enumerate(J):
+        for b in page.get("prunedResult", {}).get("parsing_res_list", []):
+            if b["block_label"] in ("display_formula", "inline_formula", "formula"):
+                key = re.sub(r'\s+', '', b["block_content"].strip().strip('$'))
+                if key and key not in FORMULA_INDEX:
+                    FORMULA_INDEX[key] = {"page": pi, "bbox": b.get("block_bbox")}
 
+
+def recover_footnotes(md, J):
     def marker_re(g):
         return r'\$\s*\^\{?\s*' + re.escape(g) + r'\s*\}?\s*\$'
-
     for page in J:
         bl = page.get("prunedResult", {}).get("parsing_res_list", [])
         fns = [b for b in bl if b["block_label"] in ("footnote", "vision_footnote")
@@ -252,6 +316,26 @@ def recover_footnotes(md, json_path):
             if not placed:
                 FOOTNOTE_LEFTOVERS.append(text)
     return md
+
+
+# ---------------------------------------------------------------- unmapped glyph scan
+_SAFE = set('，。、；：？！“”‘’（）《》【】—…·「」『』〔〕％　')
+
+
+def scan_unmapped(body):
+    for ch in body:
+        o = ord(ch)
+        if o < 128:
+            continue
+        if 0x4e00 <= o <= 0x9fff or 0x3400 <= o <= 0x4dbf:   # CJK ideographs
+            continue
+        if 0x00a0 <= o <= 0x024f:                            # accented Latin (font has it)
+            continue
+        if 0x2010 <= o <= 0x2015:                            # dashes
+            continue
+        if ch in _SAFE:
+            continue
+        REPORT["unmapped_chars"][ch] = REPORT["unmapped_chars"].get(ch, 0) + 1
 
 
 # ---------------------------------------------------------------- preamble
@@ -290,30 +374,22 @@ PREAMBLE_TMPL = r"""\documentclass[UTF8,fontset=%(fontset)s,11pt,openany]{ctexbo
 """
 
 
-def detect_title(md, json_path):
-    try:
-        J = json.load(open(json_path, encoding='utf-8'))
-        for page in J:
-            for b in page.get("prunedResult", {}).get("parsing_res_list", []):
-                if b["block_label"] == "doc_title":
-                    return re.sub(r'^#+\s*', '', b["block_content"]).strip()
-    except Exception:
-        pass
+def detect_title(md, J):
+    for page in J:
+        for b in page.get("prunedResult", {}).get("parsing_res_list", []):
+            if b["block_label"] == "doc_title":
+                return re.sub(r'^#+\s*', '', b["block_content"]).strip()
     m = re.search(r'^#\s+(.*\S)\s*$', md, re.M)
     return m.group(1).strip() if m else "Document"
 
 
 # ---------------------------------------------------------------- main pipeline
-def convert(md, json_path, imgdir, fontset, title, author, drop_toc, do_footnotes):
-    md = re.sub(r'\\n(?![A-Za-z])', ' ', md)                       # literal "\n" artifacts
+def convert(md, imgdir, fontset, title, author, drop_toc):
+    md = re.sub(r'\\n(?![A-Za-z])', ' ', md)
     md = re.sub(r'\\textcircled\{\s*(\d+)\s*\}',
                 lambda m: CIRCLED[int(m.group(1)) - 1] if 1 <= int(m.group(1)) <= 10 else m.group(0), md)
     if drop_toc:
         md = re.sub(r'\n##\s*目录\s*\n.*?(?=\n##\s)', '\n', md, flags=re.S)
-    if do_footnotes:
-        md = recover_footnotes(md, json_path)
-
-    # global protection passes (order matters)
     md = re.sub(r'\$\$(.+?)\$\$',
                 lambda m: '\n\x00D%d\x00\n' % (DISPLAY.append(m.group(1)) or len(DISPLAY) - 1),
                 md, flags=re.S)
@@ -327,14 +403,13 @@ def convert(md, json_path, imgdir, fontset, title, author, drop_toc, do_footnote
                 md, flags=re.S)
     md = re.sub(r'<div[^>]*text-align:\s*center[^>]*>', '\n\x00CB\x00\n', md)
     md = re.sub(r'</div>', '\n\x00CE\x00\n', md)
-    md = re.sub(r'</?[a-zA-Z][^<>]*>', '', md)        # strip only REAL leftover tags
+    md = re.sub(r'</?[a-zA-Z][^<>]*>', '', md)
 
     HEAD = re.compile(r'^(#{1,6})\s+(.*\S)\s*$')
     BLOCK_TOK = re.compile(r'^\x00(D|T|G)(\d+)\x00$')
     CHAPTER_PAT = re.compile(r'第\s*\d+\s*章|chapter\s+\d+', re.I)
     FRONT_BACK = {'原书序', '原书前言', '目录', '参考文献', '符号列表', '名词索引', '译者前言',
                   '内容简介', 'preface', 'references', 'bibliography', 'index'}
-
     out, buf = [], []
 
     def flush():
@@ -359,7 +434,8 @@ def convert(md, json_path, imgdir, fontset, title, author, drop_toc, do_footnote
                 out.append(r'\markboth{%s}{%s}' % (plain, plain))
                 out.append(r'\phantomsection\addcontentsline{toc}{chapter}{\texorpdfstring{%s}{%s}}'
                            % (printed, plain))
-            else:                                  # OCR mis-detected body text as heading
+            else:
+                REPORT["demoted_headings"].append(ts)
                 out.append(printed); out.append('')
         elif level == 3:
             out.append(r'\section*{%s}' % printed)
@@ -384,7 +460,7 @@ def convert(md, json_path, imgdir, fontset, title, author, drop_toc, do_footnote
             flush()
             kind, idx = mb.group(1), int(mb.group(2))
             if kind == 'D':
-                norm = normalize_math(DISPLAY[idx])
+                norm = render_math(DISPLAY[idx], 'display')
                 if not norm:
                     out.append('')
                 elif re.match(r'\\begin\{(align|gather|equation|multline|eqnarray|flalign)\*?\}', norm):
@@ -414,6 +490,9 @@ def convert(md, json_path, imgdir, fontset, title, author, drop_toc, do_footnote
         extra += [r'\end{itemize}', '']
         body += '\n' + '\n'.join(extra)
 
+    scan_unmapped(body)
+    REPORT["footnotes_unplaced"] = FOOTNOTE_LEFTOVERS
+
     preamble = PREAMBLE_TMPL % {
         'fontset': fontset, 'imgdir': imgdir,
         'title': r'\bfseries ' + title, 'author': author,
@@ -424,32 +503,55 @@ def convert(md, json_path, imgdir, fontset, title, author, drop_toc, do_footnote
 
 def main():
     ap = argparse.ArgumentParser(description="PaddleOCR markdown -> XeLaTeX book")
-    ap.add_argument("input", help="the *.md produced by PaddleOCR-VL")
-    ap.add_argument("--json", help="sibling *.json (default: input with .md->.json); used for footnotes")
+    ap.add_argument("input")
+    ap.add_argument("--json", help="sibling *.json (default: input with .md->.json)")
     ap.add_argument("--imgmap", help="image url->file map json (from download_images.py)")
-    ap.add_argument("--imgdir", default="imgs", help="image folder name for \\graphicspath (default: imgs)")
+    ap.add_argument("--imgdir", default="imgs", help="image folder for \\graphicspath (default: imgs)")
     ap.add_argument("--out", help="output .tex path (default: book.tex next to input)")
-    ap.add_argument("--fontset", default="mac",
-                    help="ctex fontset: mac | windows | ubuntu | fandol (default: mac)")
-    ap.add_argument("--title", help="title for the generated title page (default: auto from JSON/#)")
-    ap.add_argument("--author", default="", help="author line for the title page")
-    ap.add_argument("--keep-ocr-toc", action="store_true", help="keep the OCR's own messy 目录")
-    ap.add_argument("--no-footnotes", action="store_true", help="do not recover footnotes from JSON")
+    ap.add_argument("--fontset", default="mac", help="ctex fontset: mac | windows | ubuntu | fandol")
+    ap.add_argument("--title")
+    ap.add_argument("--author", default="")
+    ap.add_argument("--keep-ocr-toc", action="store_true")
+    ap.add_argument("--no-footnotes", action="store_true")
+    ap.add_argument("--report", help="write a review.json of high-risk spots for AI/human review")
+    ap.add_argument("--overrides", help="{math_id: corrected_latex_body} json applied to math")
+    ap.add_argument("--symbols", help="{char: latex} json merged into the symbol map")
     a = ap.parse_args()
 
     md_text = open(a.input, encoding="utf-8").read()
     json_path = a.json or (os.path.splitext(a.input)[0] + ".json")
     out_path = a.out or os.path.join(os.path.dirname(os.path.abspath(a.input)), "book.tex")
+    try:
+        J = json.load(open(json_path, encoding="utf-8"))
+    except Exception:
+        J = []
     if a.imgmap and os.path.exists(a.imgmap):
         IMGMAP.update(json.load(open(a.imgmap, encoding="utf-8")))
-    title = a.title or detect_title(md_text, json_path)
+    if a.overrides and os.path.exists(a.overrides):
+        OVERRIDES.update(json.load(open(a.overrides, encoding="utf-8")))
+    if a.symbols and os.path.exists(a.symbols):
+        SYM.update(json.load(open(a.symbols, encoding="utf-8")))
+        rebuild_sym_re()
 
-    tex = convert(md_text, json_path, a.imgdir, a.fontset, title, a.author,
-                  drop_toc=not a.keep_ocr_toc, do_footnotes=not a.no_footnotes)
+    build_formula_index(J)
+    title = a.title or detect_title(md_text, J)
+    if not a.no_footnotes and J:
+        md_text = recover_footnotes(md_text, J)
+
+    tex = convert(md_text, a.imgdir, a.fontset, title, a.author, drop_toc=not a.keep_ocr_toc)
     open(out_path, "w", encoding="utf-8").write(tex)
-    print("wrote %s  (display=%d inline=%d table=%d img=%d footnotes=%d, +%d in addendum)"
+
+    print("wrote %s  (display=%d inline=%d table=%d img=%d footnotes=%d, +%d addendum; "
+          "overrides applied=%d)"
           % (out_path, len(DISPLAY), len(INLINE), len(TABLE), len(IMG),
-             len(FOOTNOTES), len(FOOTNOTE_LEFTOVERS)))
+             len(FOOTNOTES), len(FOOTNOTE_LEFTOVERS), len(OVERRIDES)))
+    if a.report:
+        json.dump(REPORT, open(a.report, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+        print("review report -> %s  (math_flagged=%d, unmapped_chars=%d, demoted_headings=%d, "
+              "footnotes_unplaced=%d, missing_images=%d)"
+              % (a.report, len(REPORT["math"]), len(REPORT["unmapped_chars"]),
+                 len(REPORT["demoted_headings"]), len(REPORT["footnotes_unplaced"]),
+                 len(REPORT["missing_images"])))
 
 
 if __name__ == "__main__":

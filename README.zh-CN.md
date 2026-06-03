@@ -66,6 +66,17 @@ xelatex -interaction=nonstopmode book.tex
 | `--imgmap` / `--imgdir` | 图片 url→文件 映射，以及 `\graphicspath` 用的文件夹名 |
 | `--keep-ocr-toc` | 保留书自带那份杂乱目录（默认删除） |
 | `--no-footnotes` | 跳过从 JSON 恢复脚注 |
+| `--report FILE` | 输出 `review.json`，只列高风险点（被修复过的公式，带 `{page,bbox}`、缺字、被降级的标题、未定位脚注、缺图） |
+| `--overrides FILE` | 应用 `{公式id: 修正后的latex}`（AI 基于证据的修正），可复现 |
+| `--symbols FILE` | 把 `{字符: latex}` 合并进符号表（处理缺字） |
+
+### 提高准确度：AI 复核回路
+
+确定性内核只保证**能编译**，修不了 OCR 的**识别错**。用 `--report review.json` 跑一遍，
+拿到那一小撮被标记的点（几十处，而非几千处），让 AI/人对照**原页图**（`{page,bbox}`）和
+同名 JSON 逐个核对，把修正写进 `overrides.json` / `symbols.json`，再带 `--overrides`/`--symbols`
+重跑。修正会被可复现地应用、该点不再标记——**不用手改生成产物，也绝不编造没识别出的内容**。
+完整步骤与护栏见 [`SKILL.md`](SKILL.md)。
 
 ## 为什么不直接 `pandoc input.md`？
 

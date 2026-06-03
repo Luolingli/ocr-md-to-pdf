@@ -86,6 +86,45 @@ print('CJK runs missing from tex:',len(miss)); [print(' ',x) for x in miss[:10]]
 PY
 ```
 
+## Improving accuracy: the AI review loop (hybrid)
+The deterministic core only guarantees the document **compiles** — it cannot fix what the
+OCR mis-*recognised* (a garbled formula, a wrong symbol). That residual is where the AI
+adds value over a bare script. Keep the script for the 99% that is fine, and spend AI
+effort only on the handful of flagged spots:
+
+1. Convert with a report:
+   ```bash
+   python3 scripts/md_to_latex.py "INPUT.md" --imgmap imgmap.json --imgdir imgs \
+           --out book.tex --report review.json
+   ```
+   `review.json` lists ONLY the high-risk spots (typically a few dozen, not thousands):
+   - `math`: formulas a repair heuristic had to touch (`brace_imbalance`, `array_columns`,
+     `left_right_delim`, double sub/superscript). Each has a stable `id`, the `raw` OCR, the
+     `rendered` LaTeX, and — when matchable — the original `{page, bbox}`.
+   - `unmapped_chars`, `demoted_headings`, `footnotes_unplaced`, `missing_images`.
+2. For each flagged `math` item, **repair from evidence only**:
+   - render the source region to look at it:
+     `gs -q -dSAFER -dBATCH -dNOPAUSE -sDEVICE=png16m -r150 -dFirstPage=<page+1> -dLastPage=<page+1> -sOutputFile=chk.png book.pdf`
+     (the original page image; `bbox` is `[x0,y0,x1,y1]` on that page), and/or look up the
+     same formula in the sibling `.json`;
+   - decide the correct LaTeX from what is actually visible. **Do not invent content**: if a
+     piece is genuinely unreadable, leave the heuristic result and note it — never fabricate
+     math or text that the source does not support.
+3. Write the accepted fixes to `overrides.json` keyed by the `id`, e.g.
+   ```json
+   { "7ef8563c": "s = \\sqrt{\\mathbb{V}(\\widehat{Y}_*)}" }
+   ```
+   For unmapped glyphs, write `symbols.json`, e.g. `{ "≜": "$\\triangleq$" }`.
+4. Re-run with the overrides and recompile — fixes are applied reproducibly, no hand-editing:
+   ```bash
+   python3 scripts/md_to_latex.py "INPUT.md" --imgmap imgmap.json --imgdir imgs \
+           --out book.tex --overrides overrides.json --symbols symbols.json --report review.json
+   xelatex -interaction=nonstopmode book.tex && xelatex -interaction=nonstopmode book.tex
+   ```
+   An overridden formula stops being flagged; iterate until `review.json`'s `math` is empty
+   or only contains items you've confirmed are already correct. `overrides.json` /
+   `symbols.json` are the durable, auditable record of the AI's corrections.
+
 ## Fixing leftover errors
 The converter clears the known PaddleOCR failure classes, but a brand-new document may
 surface a new one. If `grep '^! ' xelatex2.log` is non-zero:

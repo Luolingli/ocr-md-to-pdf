@@ -69,6 +69,19 @@ xelatex -interaction=nonstopmode book.tex
 | `--imgmap` / `--imgdir` | image url→file map and the folder for `\graphicspath` |
 | `--keep-ocr-toc` | keep the book's own (messy) 目录 instead of dropping it |
 | `--no-footnotes` | skip JSON footnote recovery |
+| `--report FILE` | write a `review.json` of only the high-risk spots (repaired formulas with `{page,bbox}`, unmapped glyphs, demoted headings, unplaced footnotes, missing images) |
+| `--overrides FILE` | apply `{math_id: corrected_latex}` (an AI's evidence-based fixes) reproducibly |
+| `--symbols FILE` | merge `{char: latex}` into the symbol map (for unmapped glyphs) |
+
+### Accuracy: the AI review loop
+
+The deterministic core only guarantees the document **compiles** — it can't fix what the OCR
+*mis-recognised*. Run with `--report review.json` to get the handful of flagged spots (a few
+dozen, not thousands), have an AI/human check each against the original page image
+(`{page,bbox}`) and the sibling JSON, write corrections to `overrides.json` / `symbols.json`,
+then re-run with `--overrides`/`--symbols`. Fixes apply reproducibly and the spot stops being
+flagged — no hand-editing of generated output, no fabrication of un-OCR'd content. See
+[`SKILL.md`](SKILL.md) for the step-by-step loop and guardrails.
 
 ## Why not just `pandoc input.md`?
 
