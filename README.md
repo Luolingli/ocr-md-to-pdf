@@ -1,3 +1,5 @@
+**English** | [简体中文](README.zh-CN.md)
+
 # ocr-md-to-pdf
 
 Compile a **PaddleOCR-VL** markdown export into a fully **vector, selectable-text PDF book** with XeLaTeX.
@@ -67,6 +69,27 @@ xelatex -interaction=nonstopmode book.tex
 | `--imgmap` / `--imgdir` | image url→file map and the folder for `\graphicspath` |
 | `--keep-ocr-toc` | keep the book's own (messy) 目录 instead of dropping it |
 | `--no-footnotes` | skip JSON footnote recovery |
+
+## Why not just `pandoc input.md`?
+
+Markdown does compile to PDF directly — but feeding **PaddleOCR-VL output straight to
+pandoc essentially never produces a usable result**. This tool's value is that it fixes
+the OCR-specific landmines a generic md→PDF pipeline won't:
+
+- **Inline math `$ x $` with spaces** — pandoc requires the `$` to touch a non-space, so
+  every inline formula silently stops being math.
+- **CJK characters inside math** — XeLaTeX math mode shows tofu / errors unless each CJK
+  run is wrapped in `\text{}`.
+- **Tables are raw HTML** — pandoc's markdown→LaTeX drops bare `<table>`.
+- **Figures are signed remote URLs** — they expire; they must be fetched locally and mapped.
+- **Footnotes aren't in the .md at all** — the OCR export drops them; they can only be
+  recovered by matching the sibling `.json`, which no generic tool will do.
+- **Pervasive OCR garble** — unbalanced braces, `\left0.8`, double subscripts, nested
+  `align*`, package conflicts — any one of these halts compilation.
+
+So: **clean markdown → just use pandoc, this tool is overkill**; **PaddleOCR-VL output of a
+Chinese / math textbook → this tool turns "compiles to garbage (or not at all)" into
+"works out of the box".**
 
 ## Use as a Claude Code skill
 
