@@ -59,8 +59,23 @@ def main():
                 fail += 1; print("FAIL", name, err)
             else:
                 ok += 1; mapping[u] = name
+    # never destroy a previously good map when the signed URLs have expired — keep
+    # old entries whose files still exist on disk (re-running download_images must
+    # not turn a finished build into all-[图] placeholders)
+    old = {}
+    if os.path.exists(map_path):
+        try:
+            old = json.load(open(map_path, encoding="utf-8"))
+        except Exception:
+            old = {}
+    kept = 0
+    for u, name in old.items():
+        if u not in mapping and os.path.exists(os.path.join(out_dir, name)):
+            mapping[u] = name
+            kept += 1
     json.dump(mapping, open(map_path, "w"), ensure_ascii=False)
-    print("downloaded OK=%d FAIL=%d -> %s" % (ok, fail, map_path))
+    print("downloaded OK=%d FAIL=%d (map keeps %d previously good) -> %s"
+          % (ok, fail, kept, map_path))
 
 
 if __name__ == "__main__":

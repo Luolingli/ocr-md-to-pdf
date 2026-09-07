@@ -37,8 +37,12 @@ FOOTNOTES, FOOTNOTE_LEFTOVERS = [], []
 IMGMAP, OVERRIDES = {}, {}
 FORMULA_INDEX = {}                       # normalized formula -> {page, bbox}
 REPORT = {"math": [], "unmapped_chars": {}, "demoted_headings": [],
-          "footnotes_unplaced": [], "missing_images": []}
+          "footnotes_unplaced": [], "missing_images": [],
+          "broken_inline_spans": [], "missing_headings": []}
 _seen_math = set()
+TOC_LEVELS = {}                          # normalized printed-TOC title -> heading level (1/2/3, or 0 = report only)
+TOC_TITLES = []                          # (original title, normalized) in TOC order
+HEADINGS_SEEN = set()                    # normalized titles of all body headings
 
 
 def hid(raw):
@@ -110,6 +114,16 @@ def normalize_math(c, reasons=None):
 
     c = step(r'_([A-Za-z0-9])_([A-Za-z0-9])', r'_{\1\2}', 'double_subscript', c)
     c = step(r'\^([A-Za-z0-9])\^([A-Za-z0-9])', r'^{\1\2}', 'double_superscript', c)
+    # PaddleOCR wraps CJK text inside math as \mathrm{~ 中文 ~}; \text{} is the
+    # legal home for CJK (deterministic, so not flagged for review).
+    c = re.sub(r'\\mathrm\{~\s*([^{}~]*?)[~\s]*\}',
+               lambda m: (r'\text{%s}' % re.sub(r'\s+', ' ', m.group(1)).strip())
+                         if re.search(r'[一-鿿]', m.group(1)) else m.group(0), c)
+    # \mathbf{Greek} is undefined in OT1 math and makes XeTeX request a bogus
+    # U+0005 glyph from the bold Latin font ("Missing character: ^^E (U+0005) in
+    # lmromandemi" — a misleading diagnostic). \boldsymbol is the bold math font
+    # (amssymb is already in the preamble).
+    c = re.sub(r'\\mathbf\{([\u0391-\u03A9\u03B1-\u03C9])\}', r'\\boldsymbol{\1}', c)
     c = WRAP_RE.sub(lambda m: r'\text{' + m.group(0) + '}', c)
     nc = fix_arrays(c)
     if reasons is not None and nc != c:
@@ -351,6 +365,7 @@ PREAMBLE_TMPL = r"""\documentclass[UTF8,fontset=%(fontset)s,11pt,openany]{ctexbo
 \usepackage{fancyhdr}
 \usepackage[hidelinks,bookmarksnumbered=false]{hyperref}
 \newcommand{\cnum}[1]{\textcircled{\scriptsize #1}}
+\providecommand{\xlongequal}[1]{\mathrel{\overset{#1}{=}}}
 \graphicspath{{%(imgdir)s/}{./}}
 \setcounter{tocdepth}{1}
 \setcounter{secnumdepth}{-1}
@@ -381,6 +396,63 @@ def detect_title(md, J):
                 return re.sub(r'^#+\s*', '', b["block_content"]).strip()
     m = re.search(r'^#\s+(.*\S)\s*$', md, re.M)
     return m.group(1).strip() if m else "Document"
+
+
+# ------------------------------------------------------------ printed-TOC cross-check
+def norm_title(s):
+    """canonical form for matching a TOC entry against a body heading. Body headings
+    are seen AFTER inline math was tokenized, so the tokens are stripped here (the
+    TOC side is parsed before tokenization and its $...$ math is stripped)."""
+    s = re.sub('\x00I(\\d+)\x00', '', s)
+    s = re.sub(r'\$[^$]*\$', '', s)
+    s = re.sub(r'\s+', '', s)
+    return s.lower()
+
+
+def canon_title(s):
+    """looser canonical form for the missing-heading check: OCR may split the math of
+    the same title differently in the printed TOC vs the body heading (e.g.
+    `$ C^{*} $` vs `C $ ^{*} $`), so keep the math content but drop all math
+    punctuation, commands and non-alphanumerics (lowercased)."""
+    s = s.lower()
+    s = re.sub(r'\\[A-Za-z]+\*?', '', s)
+    s = re.sub(r'[$^_{}~\\*]', '', s)
+    s = re.sub(r'[^0-9a-z\u4e00-\u9fff]', '', s)
+    return s
+
+
+def parse_toc(md):
+    """Read the book's own printed TOC — the ground truth for structure — BEFORE it
+    is dropped. Numbered entries fix the heading level of any body heading with the
+    same title (OCR often mis-levels headings):  第N章 -> chapter(1), N.M -> section(2),
+    N.M.K -> subsection(3). Unnumbered entries (appendices, 参考文献, ...) are recorded
+    at level 0: report-only, never re-leveled. TOC entries whose title never appears
+    as a body heading end up in REPORT["missing_headings"] (OCR lost the heading)."""
+    m = re.search(r'\n##\s*目录\s*\n(.*?)(?=\n#{1,6}\s)', md, flags=re.S)
+    if not m:
+        return
+    for line in m.group(1).split('\n'):
+        s = line.strip()
+        if not s:
+            continue
+        s = re.sub(r'\s+\d+\s*$', '', s)    # trailing page number
+        if not s:
+            continue
+        if re.match(r'^第\s*(?:\d+|[一二三四五六七八九十百]+)\s*章', s):
+            # chapter titles use CJK numerals in the printed TOC (第一章 …) as well
+            # as Arabic ones (第1章 …) — strip either, keep the rest as the title
+            title = re.sub(r'^第\s*(?:\d+|[一二三四五六七八九十百]+)\s*章\s*', '', s)
+            TOC_LEVELS[norm_title(title)] = 1
+            TOC_TITLES.append((title, norm_title(title)))
+        elif re.match(r'^\d+\.\d+\.\d+', s):
+            TOC_LEVELS[norm_title(s)] = 3
+            TOC_TITLES.append((s, norm_title(s)))
+        elif re.match(r'^\d+\.\d+', s):
+            TOC_LEVELS[norm_title(s)] = 2
+            TOC_TITLES.append((s, norm_title(s)))
+        else:
+            TOC_LEVELS.setdefault(norm_title(s), 0)
+            TOC_TITLES.append((s, norm_title(s)))
 
 
 # ------------------------------------------------------------ heading repair
@@ -417,13 +489,42 @@ def convert(md, imgdir, fontset, title, author, drop_toc):
     md = re.sub(r'\\n(?![A-Za-z])', ' ', md)
     md = re.sub(r'\\textcircled\{\s*(\d+)\s*\}',
                 lambda m: CIRCLED[int(m.group(1)) - 1] if 1 <= int(m.group(1)) <= 10 else m.group(0), md)
+    parse_toc(md)
     if drop_toc:
-        md = re.sub(r'\n##\s*目录\s*\n.*?(?=\n##\s)', '\n', md, flags=re.S)
+        # stop at the next heading of ANY level — a chapter title marked ### right
+        # after the printed TOC must survive (e.g. unnumbered chapter titles).
+        md = re.sub(r'\n##\s*目录\s*\n.*?(?=\n#{1,6}\s)', '\n', md, flags=re.S)
     # a section title OCR'd as a spaced-out display formula -> a real ### heading
     md = re.sub(r'\$\$(.+?)\$\$',
                 lambda m: ('\n### ' + formula_heading_text(m.group(1)) + '\n')
                           if formula_is_heading(m.group(1)) else m.group(0),
                 md, flags=re.S)
+    # A stray unpaired '$' (odd count) silently shifts EVERY inline pairing after it —
+    # catch it loudly instead of shipping corrupted math. Likewise, an inline span that
+    # crosses lines or swallows markup (## headings, <div>...) is by definition broken.
+    # Line numbers are computed on a copy that keeps the original line structure
+    # (display formulas emptied but their newlines preserved), so they point at the
+    # md file the user has on disk.
+    md_check = re.sub(r'\$\$.+?\$\$',
+                      lambda m: '\n' * m.group(0).count('\n'), md, flags=re.S)
+    nd = md_check.count('$')
+    REPORT["inline_dollar_count"] = nd
+    if nd % 2:
+        print("WARNING: odd number of inline '$' (%d) — a stray '$' shifts EVERY "
+              "inline pairing after it. Fix the source (e.g. via --corrections) "
+              "before trusting the output." % nd)
+    for m in re.finditer(r'\$([^$]+?)\$', md_check):
+        c = m.group(1)
+        if '\n' in c or '<div' in c or c.lstrip().startswith('#'):
+            if len(REPORT["broken_inline_spans"]) < 20:
+                REPORT["broken_inline_spans"].append({
+                    "line": md_check.count('\n', 0, m.start()) + 1,
+                    "preview": c[:60].replace('\n', '⏎')})
+    if REPORT["broken_inline_spans"]:
+        print("WARNING: %d inline math span(s) cross lines or contain markup — almost "
+              "certainly a stray '$' earlier in the document. First broken span starts "
+              "near md line %d. See review.json: broken_inline_spans."
+              % (len(REPORT["broken_inline_spans"]), REPORT["broken_inline_spans"][0]["line"]))
     md = re.sub(r'\$\$(.+?)\$\$',
                 lambda m: '\n\x00D%d\x00\n' % (DISPLAY.append(m.group(1)) or len(DISPLAY) - 1),
                 md, flags=re.S)
@@ -455,7 +556,32 @@ def convert(md, imgdir, fontset, title, author, drop_toc):
 
     def heading(level, t):
         flush()
-        if level == 3 and SECTION_THM_RE.match(t.strip()):
+        # store the heading with inline-math tokens resolved back to their formula
+        # content, so the missing-heading check can compare against TOC entries
+        # whose math is still written out
+        HEADINGS_SEEN.add(re.sub('\x00I(\\d+)\x00',
+                                 lambda m: INLINE[int(m.group(1))], t))
+        # The book's own printed TOC is ground truth: when this heading's title appears
+        # in the TOC with a numbered level, trust that level over OCR's (PaddleOCR
+        # frequently mis-levels headings, e.g. sections at ## and chapters at ###).
+        # Map TOC level -> input level: the converter renders level 1 as \chapter*,
+        # 3 as \section*, 4 as \subsection*; levels <=2 that are not 第N章 get DEMOTED
+        # to body, so a TOC section must land on 3, not 2.
+        toc_promoted = False
+        tl = TOC_LEVELS.get(norm_title(t))
+        if tl == 1:
+            level, toc_promoted = 1, True
+        elif tl == 2:
+            level, toc_promoted = 3, True
+        elif tl == 3:
+            level, toc_promoted = 4, True
+        if level == 1 and not toc_promoted and re.match(r'^\d+[\.\s、]', t.strip()):
+            # OCR promoted an exercise/item number ("11. 证明定理…") to a top-level
+            # heading — a chapter never looks like that; render as body text.
+            REPORT["demoted_headings"].append(t.strip())
+            out.append(render_inline(t)); out.append('')
+            return
+        if level == 3 and not toc_promoted and SECTION_THM_RE.match(t.strip()):
             # a theorem/example paragraph mis-prefixed with ### — render as body text
             # (footnote markers kept inline), never as a TOC section.
             REPORT["demoted_headings"].append(t.strip())
@@ -505,6 +631,9 @@ def convert(md, imgdir, fontset, title, author, drop_toc):
                     out.append('')
                 elif re.match(r'\\begin\{(align|gather|equation|multline|eqnarray|flalign)\*?\}', norm):
                     out.append(norm)
+                elif norm.lstrip().startswith('['):
+                    # amsmath warns "Bracket group [x] at formula start" — \relax silences it
+                    out.append(r'\[\relax ' + norm + r'\]')
                 else:
                     out.append(r'\[' + norm + r'\]')
             elif kind == 'T':
@@ -534,6 +663,17 @@ def convert(md, imgdir, fontset, title, author, drop_toc):
 
     scan_unmapped(body)
     REPORT["footnotes_unplaced"] = FOOTNOTE_LEFTOVERS
+    # printed-TOC entries that never appear as a body heading — OCR lost the heading;
+    # restore them via --corrections (the TOC is the evidence for the exact title).
+    # Compared canonically (math split differently in TOC vs body) and with a suffix
+    # allowance (a body chapter heading may carry the 第N章 prefix the TOC line had).
+    seen_canon = {canon_title(nb) for nb in HEADINGS_SEEN}
+
+    def toc_seen(title):
+        c = canon_title(title)
+        return bool(c) and (c in seen_canon or any(c2.endswith(c) for c2 in seen_canon))
+
+    REPORT["missing_headings"] = [orig for orig, _nk in TOC_TITLES if not toc_seen(orig)]
 
     preamble = PREAMBLE_TMPL % {
         'fontset': fontset, 'imgdir': imgdir,
@@ -596,9 +736,11 @@ def main():
     if a.report:
         json.dump(REPORT, open(a.report, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
         print("review report -> %s  (math_flagged=%d, unmapped_chars=%d, demoted_headings=%d, "
-              "footnotes_unplaced=%d, missing_images=%d)"
+              "broken_inline_spans=%d, missing_headings=%d, footnotes_unplaced=%d, "
+              "missing_images=%d)"
               % (a.report, len(REPORT["math"]), len(REPORT["unmapped_chars"]),
-                 len(REPORT["demoted_headings"]), len(REPORT["footnotes_unplaced"]),
+                 len(REPORT["demoted_headings"]), len(REPORT["broken_inline_spans"]),
+                 len(REPORT["missing_headings"]), len(REPORT["footnotes_unplaced"]),
                  len(REPORT["missing_images"])))
 
 

@@ -28,7 +28,11 @@ bash "$SKILL/build.sh" "/path/to/NAME.pdf_by_PaddleOCR-VL-1.6.md"
 # → writes NAME's folder/book.pdf  (override out dir with BUILD=/tmp/build)
 # extra args go to the converter, e.g.  ... --fontset fandol --title "书名"
 ```
-`build.sh` does all three stages and reports page count + remaining LaTeX errors.
+`build.sh` does all stages and reports page count + remaining LaTeX errors. It also
+auto-loads `overrides.json` / `symbols.json` / `corrections.json` from the build dir
+when present (the AI-review artifacts from a previous run), always writes
+`review.json`, and finishes with a content-fidelity audit (`audit.py`) and a
+source-vs-output page-count hint.
 
 ## Manual stages (use these to debug or customize)
 ```bash
@@ -59,11 +63,26 @@ xelatex -interaction=nonstopmode book.tex
 - Headings → `\chapter*` / `\section*` / … with PDF bookmarks; OCR-misdetected body text
   promoted to a fake top-level heading is demoted back to text (only `第N章` / known
   front-/back-matter titles become chapters); running header set per chapter via `\markboth`.
+  **The book's own printed TOC is ground truth**: any body heading whose title matches a
+  numbered TOC entry is re-leveled to the TOC's level (`第N章`→chapter, `N.M`→section,
+  `N.M.K`→subsection), which fixes PaddleOCR's frequent heading-level misassignment
+  (e.g. sections marked `##` and unnumbered chapter titles marked `###`). TOC entries
+  that never appear as a body heading are reported in `review.json: missing_headings`
+  (the OCR lost the heading — restore it via `--corrections`).
 - Footnotes (dropped by the .md export) recovered from the JSON: placed inline at their
   `$^{①}$` marker by page-context; any that can't be located go to a "补充脚注" appendix.
 - Robustness for OCR garble: HTML entities, literal `\n`, `\textcircled{n}`, stray text
   `<`/`>`, double sub/superscripts, under-counted `array` columns, bare `\left`/`\right`,
   unbalanced braces — all repaired so the document compiles.
+- PaddleOCR idiosyncrasies in math: CJK wrapped as `\mathrm{~ 中文 ~}` is rewritten to
+  `\text{中文}`; `\mathbf{Greek}` (undefined in OT1 math — it makes XeTeX request a
+  bogus U+0005 glyph from the bold Latin font) is rewritten to `\boldsymbol{Greek}`;
+  `\xlongequal{def}` ("defined as" equals) is provided in the preamble; display formulas
+  that start with a bracket get a `\relax` prefix to silence the amsmath warning.
+- Loud structural checks: an **odd number of inline `$`** (a stray unpaired `$` shifts
+  every inline pairing after it) and any inline span that crosses lines or swallows
+  markup are reported loudly — do not trust the output until they are fixed via
+  `--corrections`.
 
 ## Verify the result
 After compiling, **check the log and the pages**:
@@ -74,16 +93,9 @@ gs -q -dSAFER -dBATCH -dNOPAUSE -sDEVICE=png16m -r110 \
    -dFirstPage=N -dLastPage=N -sOutputFile=p.png book.pdf   # eyeball a page
 ```
 Confirm fidelity (no content dropped): every long CJK run in the md should appear in the
-tex — see the audit one-liner below.
+tex — `build.sh` runs this automatically via `scripts/audit.py`; manually:
 ```bash
-python3 - "$INPUT_MD" book.tex <<'PY'
-import re,sys
-md=open(sys.argv[1],encoding='utf-8').read(); tex=re.sub(r'\s+','',open(sys.argv[2],encoding='utf-8').read())
-md=re.sub(r'<table.*?</table>',' ',md,flags=re.S); md=re.sub(r'\$\$.+?\$\$',' ',md,flags=re.S)
-md=re.sub(r'\$[^$]+?\$',' ',md); md=re.sub(r'<[^>]+>',' ',md)
-miss=[r for r in set(re.findall(r'[一-鿿]{6,}',md)) if r not in tex]
-print('CJK runs missing from tex:',len(miss)); [print(' ',x) for x in miss[:10]]
-PY
+python3 "$SKILL/audit.py" "<INPUT.md>" book.tex   # exit 1 lists missing runs
 ```
 
 ## Improving accuracy: the AI review loop (hybrid)
@@ -101,7 +113,13 @@ effort only on the handful of flagged spots:
    - `math`: formulas a repair heuristic had to touch (`brace_imbalance`, `array_columns`,
      `left_right_delim`, double sub/superscript). Each has a stable `id`, the `raw` OCR, the
      `rendered` LaTeX, and — when matchable — the original `{page, bbox}`.
+   - `broken_inline_spans`: inline spans that cross lines or contain markup (a stray `$`
+     earlier in the document). Each has the `line` in the md where the broken span starts —
+     the culprit `$` is at or just before that line.
+   - `missing_headings`: printed-TOC entries with no matching body heading (OCR dropped the
+     heading). Restore them with `--corrections` (the TOC is the title evidence).
    - `unmapped_chars`, `demoted_headings`, `footnotes_unplaced`, `missing_images`.
+   - `inline_dollar_count`: total inline `$` in the md (odd = broken, see above).
 2. For each flagged `math` item, **repair from evidence only**:
    - render the source region to look at it:
      `gs -q -dSAFER -dBATCH -dNOPAUSE -sDEVICE=png16m -r150 -dFirstPage=<page+1> -dLastPage=<page+1> -sOutputFile=chk.png book.pdf`
@@ -140,6 +158,20 @@ surface a new one. If `grep '^! ' xelatex2.log` is non-zero:
 3. Add the fix to `md_to_latex.py` (usually a new symbol in `SYM`, a guard in
    `normalize_math`, or a tighter regex), regenerate, recompile. Do **not** hand-edit
    `book.tex` — it is regenerated every run.
+
+Known misleading diagnostics (learned the hard way):
+- `Missing character: There is no ^^E (U+0005) in font [lmromandemi10-regular]` — the
+  U+0005 is a red herring: it is XeTeX asking the *bold Latin* font for a glyph slot that
+  doesn't exist, caused by `\mathbf` applied to a Greek letter (e.g. `\mathbf{\Pi}`, an
+  OCR misread of a bold math symbol). The character is NOT in your `.tex`; grep for
+  `\mathbf{` + Greek. The converter now rewrites these to `\boldsymbol{...}`, but if the
+  *intended* symbol is something else entirely (e.g. a pre-annihilator `⊥N` misread as
+  `\mathbf{\Pi}^\perp N`), use `--corrections` with the book's own usage elsewhere as
+  evidence.
+- A wall of `Improper \prevdepth` / `Missing \cr` / `Missing }` errors at the *next*
+  heading after a formula: the formula above it has an unclosed construct (e.g. a
+  `\begin{array}` with no `\end{array}` — OCR sometimes mangles a big symbol like `⋂`
+  into a broken array). Fix the formula, and the cascade disappears.
 
 ## Notes
 - Re-run `download_images.py` before converting if the signed image URLs have expired
