@@ -41,7 +41,13 @@ def main():
         i, u = i_u
         if not u.lower().startswith(("http://", "https://")):
             return (u, u, None)                              # local path: map as-is
-        name = "img%03d.jpg" % i
+        # Keep the source basename: the markdown refers to imgs/<basename>, and a
+        # generic img%03d.jpg name makes imgmap.json stop matching imgmap/imgdir
+        # on any rebuild (xelatex then fails with "Unable to load picture").
+        base = os.path.basename(u.split("?")[0]) or ("img%03d.jpg" % i)
+        if not re.search(r"\.(jpe?g|png|gif|bmp|webp|pdf|eps)$", base, re.I):
+            base = "img%03d.jpg" % i
+        name = base
         try:
             req = urllib.request.Request(u, headers={"User-Agent": "Mozilla/5.0"})
             data = urllib.request.urlopen(req, timeout=30).read()

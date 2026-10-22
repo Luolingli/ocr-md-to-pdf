@@ -22,15 +22,14 @@ mkdir -p "$BUILD"
 echo "== [1/4] downloading images =="
 python3 "$SKILL_DIR/download_images.py" "$MD" --out-dir "$BUILD/imgs" --map "$BUILD/imgmap.json"
 
-EXTRA=""
-[ -f "$BUILD/overrides.json" ]   && EXTRA="$EXTRA --overrides $BUILD/overrides.json"
-[ -f "$BUILD/symbols.json" ]     && EXTRA="$EXTRA --symbols $BUILD/symbols.json"
-[ -f "$BUILD/corrections.json" ] && EXTRA="$EXTRA --corrections $BUILD/corrections.json"
+EXTRA=()
+[ -f "$BUILD/overrides.json" ]   && EXTRA+=(--overrides "$BUILD/overrides.json")
+[ -f "$BUILD/symbols.json" ]     && EXTRA+=(--symbols "$BUILD/symbols.json")
+[ -f "$BUILD/corrections.json" ] && EXTRA+=(--corrections "$BUILD/corrections.json")
 
 echo "== [2/4] markdown -> LaTeX =="
-# shellcheck disable=SC2086
 python3 "$SKILL_DIR/md_to_latex.py" "$MD" --imgmap "$BUILD/imgmap.json" --imgdir imgs \
-        --out "$BUILD/book.tex" --report "$BUILD/review.json" $EXTRA "$@"
+        --out "$BUILD/book.tex" --report "$BUILD/review.json" ${EXTRA[@]+"${EXTRA[@]}"} "$@"
 
 echo "== [3/4] xelatex pass 1 =="
 ( cd "$BUILD" && xelatex -interaction=nonstopmode book.tex >xelatex1.log 2>&1 || true )
@@ -41,6 +40,12 @@ ERR=$(grep -cE '^! ' "$BUILD/xelatex2.log" || true)
 MISS=$(grep -c 'Missing character' "$BUILD/xelatex2.log" || true)
 PAGES=$(grep -oE 'Output written on .* \([0-9]+ page' "$BUILD/xelatex2.log" | grep -oE '[0-9]+ page' || echo "?")
 echo "done: $BUILD/book.pdf  (errors=$ERR, missing_glyphs=$MISS, $PAGES)"
+
+# source-book -> PDF page map (only when the md carries <!--bookpage:N--> markers)
+if grep -q 'newlabel{bookpage:' "$BUILD/book.aux" 2>/dev/null; then
+  python3 "$SKILL_DIR/page_map.py" "$BUILD/book.aux" > "$BUILD/page_map.json" \
+    && echo "book-page map -> $BUILD/page_map.json"
+fi
 
 echo "== content-fidelity audit =="
 python3 "$SKILL_DIR/audit.py" "$MD" "$BUILD/book.tex" || echo "NOTE: audit found missing content — see above"
