@@ -118,6 +118,18 @@ effort only on the handful of flagged spots:
      the culprit `$` is at or just before that line.
    - `missing_headings`: printed-TOC entries with no matching body heading (OCR dropped the
      heading). Restore them with `--corrections` (the TOC is the title evidence).
+     **Not every entry here is a real problem** — triage before touching the md:
+     * *TOC sub-entries* (`几个例子`, `子列`, `曲线的拐点`, `平面束`, …) are the **second- and
+       third-level lines of the book's own printed 目录**: they sit indented under a `§N`
+       line and a matching body heading usually *does* exist, just without a `#` mark
+       (grep the title in `book.tex` — if it is there as plain text, the PDF is fine and
+       this is a false alarm). Silently editing them only corrupts the TOC parse.
+     * *Scan artefacts* are the real junk: captions/headers of the scanning service
+       baked into the page (e.g. nine repeated `N. 2000年，中国人口…达到14亿人。` lines
+       printed across a 目录 page by the scanner overlay). These are **not book content**
+       and should be deleted from the md outright — see the junk-hunt recipe below.
+     * A literal `<!--bookpage:N-->` appearing as an entry means a page marker leaked into
+       the printed-TOC text; delete that line.
    - `unmapped_chars`, `demoted_headings`, `footnotes_unplaced`, `missing_images`.
    - `inline_dollar_count`: total inline `$` in the md (odd = broken, see above).
 2. For each flagged `math` item, **repair from evidence only**:
@@ -148,6 +160,39 @@ effort only on the handful of flagged spots:
    An overridden formula stops being flagged; iterate until `review.json`'s `math` is empty
    or only contains items you've confirmed are already correct. `overrides.json` /
    `symbols.json` are the durable, auditable record of the AI's corrections.
+
+## Hunting scan artefacts (non-book text baked into the page)
+
+Scanned-page services sometimes leave their own text on the page (order numbers,
+"Scanned with CamScanner", promotional lines, a客服 hotline). OCR reads them faithfully,
+so they are **not** OCR errors — but they are not book content either and must be removed
+from the md. They cluster on front matter (目录/版权页), never inside the mathematical body.
+
+Recipe — look before you cut, and cut with assertions:
+
+```bash
+# 1) find the suspicious text and count it
+grep -n 'Scanned with CamScanner\|2000年\|camscanner' "<book>.md"
+# 2) confirm which source page it came from — if it is in the JSON too, it is really
+#    printed on the page (not an md corruption)
+python3 - <<'PY'
+import json
+J=json.load(open("<book>.json",encoding="utf-8"))
+for i,p in enumerate(J,1):
+    for b in p.get("prunedResult",{}).get("parsing_res_list",[]):
+        if "Scanned with CamScanner" in b.get("block_content",""):
+            print(i, b["block_label"], b["block_content"][:80])
+PY
+# 3) delete the whole run of lines in one shot, asserting the expected count,
+#    then rebuild and prove it is gone from the RENDERED pdf (not just the md):
+gs -q -dSAFER -dBATCH -dNOPAUSE -sDEVICE=txtwrite -sOutputFile=/tmp/all.txt book.pdf
+grep -c '2000年' /tmp/all.txt     # must be 0
+```
+
+Rules: back up the md first; assert the exact number of hit lines before deleting (a
+blank/regex-too-wide replace once ate a whole corpus); after rebuilding, verify with
+`gs -sDEVICE=txtwrite` on the **PDF**, because a clean `book.tex` alone does not prove the
+page is clean.
 
 ## Fixing leftover errors
 The converter clears the known PaddleOCR failure classes, but a brand-new document may
